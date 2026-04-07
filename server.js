@@ -42,6 +42,8 @@ function kommoRequest(method, path, body = null) {
   });
 }
 
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
 app.get('/health', (req, res) => {
   res.json({ status: 'ok' });
 });
@@ -60,7 +62,7 @@ app.get('/all-deals', async (req, res) => {
   try {
     console.log('🔍 Загружаю ВСЕ сделки...');
     
-    const dealsResponse = await kommoRequest('GET', '/api/v4/leads?limit=200&page=1');
+    const dealsResponse = await kommoRequest('GET', '/api/v4/leads?limit=2000&page=1');
     
     console.log('Response keys:', Object.keys(dealsResponse));
     
@@ -83,6 +85,10 @@ app.get('/all-deals', async (req, res) => {
     }
 
     console.log(`📊 Найдено ${leadsList.length} сделок`);
+
+    // Проверяем первые 150 сделок
+    const dealsToCheck = leadsList.slice(0, 150);
+    console.log(`🔎 Обрабатываем первые ${dealsToCheck.length} сделок`);
 
     // Сгруппировать по status_id
     const byStatus = {};
@@ -111,6 +117,42 @@ app.get('/all-deals', async (req, res) => {
 
   } catch (error) {
     console.error('Error:', error.message);
+    res.status(500).json({ status: 'error', error: error.message });
+  }
+});
+
+
+// Статистика по статусам
+app.get('/stats', async (req, res) => {
+  try {
+    const dealsResponse = await kommoRequest('GET', '/api/v4/leads?limit=2000&page=1');
+    let leadsList = [];
+    if (dealsResponse._embedded && dealsResponse._embedded.leads) {
+      leadsList = dealsResponse._embedded.leads;
+    } else if (Array.isArray(dealsResponse)) {
+      leadsList = dealsResponse;
+    }
+
+    const statsByStatus = {};
+    leadsList.forEach(lead => {
+      const sid = lead.status_id;
+      if (!statsByStatus[sid]) statsByStatus[sid] = 0;
+      statsByStatus[sid]++;
+      // Пауза 300мс между Claude запросами
+      // await sleep(300);
+    });
+
+    const stats = Object.entries(statsByStatus)
+      .map(([status_id, count]) => ({ status_id: Number(status_id), count }))
+      .sort((a, b) => b.count - a.count);
+
+    res.json({
+      status: 'success',
+      totalDeals: leadsList.length,
+      uniqueStatuses: stats.length,
+      byStatus: stats,
+    });
+  } catch (error) {
     res.status(500).json({ status: 'error', error: error.message });
   }
 });
