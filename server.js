@@ -30,8 +30,7 @@ function kommoRequest(method, path, body = null) {
         try {
           resolve(JSON.parse(data));
         } catch (e) {
-          console.error('Parse error:', e.message);
-          resolve({ error: 'Parse error', raw: data.substring(0, 100) });
+          resolve({ error: 'Parse error' });
         }
       });
     });
@@ -42,7 +41,41 @@ function kommoRequest(method, path, body = null) {
   });
 }
 
-const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+async function analyzeDealWithClaude(dealId, dealName, dealText) {
+  const prompt = `Проанализируй сделку и определи статус. Имя: ${dealName} Текст: ${dealText} Возможные статусы: "По почте", "Пора бучить отпечатки", "Wniosek подан по почте", "Отпечатки зарезервированы", "Отпечатки поданы", "Второе вызвание", "Доки поданы", "Позитивная", "Отказ аппеляция", "Отстойники", "Статус не известен". Ответь ТОЛЬКО JSON: {"stage":"название","confidence":0-100,"reason":"причина"}`;
+
+  try {
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'x-api-key': CONFIG.claudeKey,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: 'claude-opus-4-20250805',
+        max_tokens: 300,
+        messages: [{ role: 'user', content: prompt }],
+      }),
+    });
+
+    const data = await response.json();
+    const content = data.content[0]?.text || '{}';
+    const jsonMatch = content.match(/\{[\s\S]*\}/);
+    return JSON.parse(jsonMatch ? jsonMatch[0] : '{}');
+  } catch (error) {
+    return { stage: 'Статус не известен', confidence: 0, reason: 'Error' };
+  }
+}
+
+async function extractDealText(deal) {
+  try {
+    const notes = deal.notes ? deal.notes.map(n => n.params?.text || '').join(' | ') : '';
+    const created = deal.created_at ? new Date(deal.created_at * 1000).toLocaleDateString('ru-RU') : '';
+    return `${deal.name || ''} | ${notes} | ${created}`.substring(0, 2000);
+  } catch (e) {
+    return deal.name || '';
+  }
+}
 
 app.get('/health', (req, res) => {
   res.json({ status: 'ok' });
@@ -57,100 +90,76 @@ app.get('/status', (req, res) => {
   });
 });
 
-// Показать ВСЕ сделки и их status_id
 app.get('/all-deals', async (req, res) => {
   try {
-    console.log('🔍 Загружаю ВСЕ сделки...');
-    
-    const dealsResponse = await kommoRequest('GET', '/api/v4/leads?limit=2000&page=1');
-    
-    console.log('Response keys:', Object.keys(dealsResponse));
-    
-    let leadsList = [];
-    if (dealsResponse._embedded && dealsResponse._embedded.leads) {
-      leadsList = dealsResponse._embedded.leads;
-    } else if (Array.isArray(dealsResponse)) {
-      leadsList = dealsResponse;
-    } else {
-      return res.json({ 
-        status: 'error', 
-        message: 'Неожиданная структура API',
-        received: Object.keys(dealsResponse),
-        sample: JSON.stringify(dealsResponse).substring(0, 300)
-      });
-    }
+    const deals = await kommoRequest('GET', '/api/v4/leads?limit=1000&page=1');
+    let leadsList = deals._embedded?.leads || [];
+    if (leadsList.length === 0) return res.json({ status: 'error', message: 'Нет сделок' });
 
-    if (leadsList.length === 0) {
-      return res.json({ status: 'error', message: 'Нет сделок' });
-    }
-
-    console.log(`📊 Найдено ${leadsList.length} сделок`);
-
-    // Проверяем первые 150 сделок
-    const dealsToCheck = leadsList.slice(0, 150);
-    console.log(`🔎 Обрабатываем первые ${dealsToCheck.length} сделок`);
-
-    // Сгруппировать по status_id
     const byStatus = {};
     leadsList.forEach(lead => {
       const sid = lead.status_id || 'unknown';
       if (!byStatus[sid]) byStatus[sid] = [];
-      byStatus[sid].push({
-        id: lead.id,
-        name: lead.name,
-        status_id: lead.status_id,
-      });
+      byStatus[sid].push({ id: lead.id, name: lead.name });
     });
 
     const summary = Object.entries(byStatus).map(([sid, deals]) => ({
       status_id: sid,
       count: deals.length,
-      sample_deals: deals.slice(0, 2).map(d => `${d.id}: ${d.name}`),
-    }));
+    })).sort((a, b) => b.count - a.count);
 
-    res.json({
-      status: 'success',
-      totalDeals: leadsList.length,
-      uniqueStatuses: Object.keys(byStatus).length,
-      summary: summary,
-    });
-
+    res.json({ status: 'success', totalDeals: leadsList.length, summary });
   } catch (error) {
-    console.error('Error:', error.message);
     res.status(500).json({ status: 'error', error: error.message });
   }
 });
 
-
-// Статистика по статусам
-app.get('/stats', async (req, res) => {
+app.get('/check-deals', async (req, res) => {
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
   try {
-    const dealsResponse = await kommoRequest('GET', '/api/v4/leads?limit=2000&page=1');
-    let leadsList = [];
-    if (dealsResponse._embedded && dealsResponse._embedded.leads) {
-      leadsList = dealsResponse._embedded.leads;
-    } else if (Array.isArray(dealsResponse)) {
-      leadsList = dealsResponse;
+    const deals = await kommoRequest('GET', '/api/v4/leads?limit=2000&page=1');
+    let leadsList = deals._embedded?.leads || [];
+    if (leadsList.length === 0) return res.json({ status: 'error', message: 'Нет сделок' });
+
+    const recommendations = [];
+    const notMoved = [];
+    const checkLimit = Math.min(leadsList.length, 150);
+
+    for (let i = 0; i < checkLimit; i++) {
+      const deal = leadsList[i];
+      const dealText = await extractDealText(deal);
+      const analysis = await analyzeDealWithClaude(deal.id, deal.name, dealText);
+
+      if (analysis.confidence >= 70 && analysis.stage !== 'Статус не известен') {
+        recommendations.push({
+          dealId: deal.id,
+          dealName: deal.name,
+          currentStatus: deal.status_id,
+          newStage: analysis.stage,
+          confidence: analysis.confidence,
+          reason: analysis.reason,
+        });
+      } else {
+        notMoved.push({
+          dealId: deal.id,
+          dealName: deal.name,
+          currentStatus: deal.status_id,
+          confidence: analysis.confidence,
+        });
+      }
+      await new Promise(r => setTimeout(r, 300));
     }
-
-    const statsByStatus = {};
-    leadsList.forEach(lead => {
-      const sid = lead.status_id;
-      if (!statsByStatus[sid]) statsByStatus[sid] = 0;
-      statsByStatus[sid]++;
-      // Пауза 300мс между Claude запросами
-      // await sleep(300);
-    });
-
-    const stats = Object.entries(statsByStatus)
-      .map(([status_id, count]) => ({ status_id: Number(status_id), count }))
-      .sort((a, b) => b.count - a.count);
 
     res.json({
       status: 'success',
-      totalDeals: leadsList.length,
-      uniqueStatuses: stats.length,
-      byStatus: stats,
+      summary: {
+        checkedDeals: checkLimit,
+        totalDeals: leadsList.length,
+        toMove: recommendations.length,
+        toKeep: notMoved.length,
+      },
+      recommendations: recommendations.slice(0, 30),
+      notMoved: notMoved.slice(0, 10),
     });
   } catch (error) {
     res.status(500).json({ status: 'error', error: error.message });
@@ -158,8 +167,6 @@ app.get('/stats', async (req, res) => {
 });
 
 app.listen(CONFIG.port, () => {
-  console.log(`✅ Kommo Bot запущен на порту ${CONFIG.port}`);
-  console.log(`📊 /status`);
-  console.log(`🏥 /health`);
-  console.log(`📈 /all-deals - ВСЕ СДЕЛКИ`);
+  console.log(`✅ Kommo Bot на порту ${CONFIG.port}`);
+  console.log(`📊 /status, /all-deals, /check-deals`);
 });
